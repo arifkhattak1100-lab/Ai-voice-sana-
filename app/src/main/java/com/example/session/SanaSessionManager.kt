@@ -1,13 +1,18 @@
 package com.example.session
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.util.Base64
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.CentralSanaAudioManager
+import com.example.audio.SanaWakeWordManager
+import com.example.brain.SanaBrain
 import com.example.data.api.GeminiApiClient
 import com.example.data.database.ChatMessageEntity
 import com.example.data.database.MemoryEntity
+import com.example.data.database.SanaMemoryManager
 import com.example.data.database.SanaRepository
 import com.example.data.model.AudioPlaybackState
 import com.example.data.model.ChatMessage
@@ -18,13 +23,20 @@ import com.example.data.model.SanaLanguage
 import com.example.data.model.SenderType
 import com.example.data.model.ToolCallResult
 import com.example.data.model.VoiceMode
-import com.example.tools.AndroidToolsManager
+import com.example.permission.SanaPermissionManager
+import com.example.service.SanaForegroundService
+import com.example.tools.ConfirmationLevel
+import com.example.tools.PendingConfirmation
+import com.example.tools.SanaToolRouter
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 
 class SanaSessionManager(
     private val context: Context,
@@ -33,7 +45,21 @@ class SanaSessionManager(
 
     private val geminiClient = GeminiApiClient()
     val audioManager = CentralSanaAudioManager(context)
-    private val toolsManager = AndroidToolsManager(context)
+    val toolRouter = SanaToolRouter(context)
+    val permissionManager = SanaPermissionManager(context)
+    val memoryManager = SanaMemoryManager(repository, viewModelScope)
+    val brain = SanaBrain(geminiClient)
+
+    // Wake Word Manager
+    val wakeWordManager = SanaWakeWordManager(
+        context = context,
+        onWakeWordDetected = { text ->
+            sendMessage(text)
+        },
+        onError = { err ->
+            _voiceError.value = err
+        }
+    )
 
     // SANA State
     private val _nickname = MutableStateFlow("Boss")
@@ -57,14 +83,21 @@ class SanaSessionManager(
     private val _playbackState = MutableStateFlow(AudioPlaybackState.IDLE)
     val playbackState: StateFlow<AudioPlaybackState> = _playbackState.asStateFlow()
 
-    private val _isMemoryEnabled = MutableStateFlow(true)
-    val isMemoryEnabled: StateFlow<Boolean> = _isMemoryEnabled.asStateFlow()
-
     private val _wakeWordEnabled = MutableStateFlow(false)
     val wakeWordEnabled: StateFlow<Boolean> = _wakeWordEnabled.asStateFlow()
 
     private val _backgroundAssistantEnabled = MutableStateFlow(false)
     val backgroundAssistantEnabled: StateFlow<Boolean> = _backgroundAssistantEnabled.asStateFlow()
+
+    // Confirmation Setting
+    private val _confirmationEnabled = MutableStateFlow(true)
+    val confirmationEnabled: StateFlow<Boolean> = _confirmationEnabled.asStateFlow()
+
+    private val _confirmationLevel = MutableStateFlow(ConfirmationLevel.CONFIRM)
+    val confirmationLevel: StateFlow<ConfirmationLevel> = _confirmationLevel.asStateFlow()
+
+    private val _pendingConfirmation = MutableStateFlow<PendingConfirmation?>(null)
+    val pendingConfirmation: StateFlow<PendingConfirmation?> = _pendingConfirmation.asStateFlow()
 
     // Voice test and error feedback
     private val _voiceTestPassed = MutableStateFlow(false)
@@ -77,22 +110,24 @@ class SanaSessionManager(
     private val _diagnostics = MutableStateFlow(DiagnosticsState())
     val diagnostics: StateFlow<DiagnosticsState> = _diagnostics.asStateFlow()
 
-    // Pending confirmation for sensitive tools
-    private val _pendingToolConfirmation = MutableStateFlow<AndroidToolsManager.PendingConfirmation?>(null)
-    val pendingToolConfirmation: StateFlow<AndroidToolsManager.PendingConfirmation?> = _pendingToolConfirmation.asStateFlow()
-
     // Active Chat Messages
     private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
+
+    // Image Generation state
+    private val _isGeneratingImage = MutableStateFlow(false)
+    val isGeneratingImage: StateFlow<Boolean> = _isGeneratingImage.asStateFlow()
+
+    val isMemoryEnabled: StateFlow<Boolean> = memoryManager.isMemoryEnabled
 
     // Room database memory entities
     val persistentMemory: StateFlow<List<MemoryEntity>> = repository.allMemory
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     init {
-        // Load initial greeting
         loadInitialGreeting()
         loadPersistedSettings()
+        permissionManager.refreshPermissions()
     }
 
     private fun loadPersistedSettings() {
@@ -103,13 +138,16 @@ class SanaSessionManager(
                 VoiceMode.entries.find { it.name == modeName }?.let { _voiceMode.value = it }
             }
             repository.getMemory("romantic")?.let { _isRomanticMode.value = it.toBoolean() }
+            repository.getMemory("language")?.let { code ->
+                SanaLanguage.entries.find { it.code == code }?.let { _selectedLanguage.value = it }
+            }
         }
     }
 
     private fun loadInitialGreeting() {
         val initialMessage = ChatMessage(
             sender = SenderType.SANA,
-            text = "Hey, Boss! ❤️ I'm SANA. I'm here. What are we going to talk about?",
+            text = "Hey Boss! ❤️ I'm SANA, your full phone control voice assistant. Ready when you are!",
             emotion = EmotionTone.HAPPY.emoji,
             hasAudio = false
         )
@@ -128,7 +166,7 @@ class SanaSessionManager(
         val targetVoice = GeminiVoice.findByName(mode.defaultVoiceName)
         _selectedVoice.value = targetVoice
         viewModelScope.launch {
-            if (_isMemoryEnabled.value) {
+            if (memoryManager.isMemoryEnabled.value) {
                 repository.saveMemory("mode", mode.name)
                 repository.saveMemory("voice", targetVoice.name)
             }
@@ -138,7 +176,7 @@ class SanaSessionManager(
     fun setGeminiVoice(voice: GeminiVoice) {
         _selectedVoice.value = voice
         viewModelScope.launch {
-            if (_isMemoryEnabled.value) {
+            if (memoryManager.isMemoryEnabled.value) {
                 repository.saveMemory("voice", voice.name)
             }
         }
@@ -152,7 +190,7 @@ class SanaSessionManager(
             _voiceMode.value = VoiceMode.CUTE
         }
         viewModelScope.launch {
-            if (_isMemoryEnabled.value) {
+            if (memoryManager.isMemoryEnabled.value) {
                 repository.saveMemory("romantic", enabled.toString())
             }
         }
@@ -160,7 +198,7 @@ class SanaSessionManager(
 
     fun setNickname(newNickname: String, persist: Boolean = true) {
         _nickname.value = newNickname
-        if (persist && _isMemoryEnabled.value) {
+        if (persist && memoryManager.isMemoryEnabled.value) {
             viewModelScope.launch {
                 repository.saveMemory("nickname", newNickname)
             }
@@ -170,27 +208,66 @@ class SanaSessionManager(
     fun setLanguage(language: SanaLanguage) {
         _selectedLanguage.value = language
         viewModelScope.launch {
-            if (_isMemoryEnabled.value) {
+            if (memoryManager.isMemoryEnabled.value) {
                 repository.saveMemory("language", language.code)
             }
         }
     }
 
     fun toggleMemory(enabled: Boolean) {
-        _isMemoryEnabled.value = enabled
+        memoryManager.setMemoryEnabled(enabled)
     }
 
     fun toggleWakeWord(enabled: Boolean) {
         _wakeWordEnabled.value = enabled
+        if (enabled) {
+            wakeWordManager.startListening(_selectedLanguage.value.code)
+        } else {
+            wakeWordManager.stopListening()
+        }
     }
 
     fun toggleBackgroundAssistant(enabled: Boolean) {
         _backgroundAssistantEnabled.value = enabled
+        if (enabled) {
+            SanaForegroundService.startService(context)
+        } else {
+            SanaForegroundService.stopService(context)
+        }
+    }
+
+    fun toggleConfirmation(enabled: Boolean) {
+        _confirmationEnabled.value = enabled
+        toolRouter.confirmationEnabled = enabled
+    }
+
+    fun setConfirmationLevel(level: ConfirmationLevel) {
+        _confirmationLevel.value = level
+        toolRouter.confirmationLevel = level
+    }
+
+    fun confirmPendingAction() {
+        val pending = _pendingConfirmation.value ?: return
+        _pendingConfirmation.value = null
+        val result = pending.execute()
+        handleToolOutcome(result)
+    }
+
+    fun dismissPendingAction() {
+        _pendingConfirmation.value = null
+        val cancelMsg = "Cancelled, Boss."
+        val sanaMsg = ChatMessage(
+            sender = SenderType.SANA,
+            text = cancelMsg,
+            emotion = EmotionTone.CASUAL.emoji
+        )
+        _messages.value = _messages.value + sanaMsg
+        speakWithGeminiAudio(cancelMsg)
     }
 
     fun clearAllMemory() {
         viewModelScope.launch {
-            repository.clearMemory()
+            memoryManager.clearAllMemory()
             _nickname.value = "Boss"
             _selectedVoice.value = GeminiVoice.findByName("Aoede")
             _voiceMode.value = VoiceMode.CUTE
@@ -199,15 +276,11 @@ class SanaSessionManager(
     }
 
     fun deleteMemoryItem(id: Long) {
-        viewModelScope.launch {
-            repository.deleteMemory(id)
-        }
+        memoryManager.deleteMemory(id)
     }
 
     fun saveCustomMemory(key: String, value: String) {
-        viewModelScope.launch {
-            repository.saveMemory(key, value, "user_note")
-        }
+        memoryManager.saveMemory(key, value, "user_note")
     }
 
     // -------------------------------------------------------------
@@ -228,44 +301,64 @@ class SanaSessionManager(
         )
         _messages.value = _messages.value + userMsg
 
-        // Check for quick nickname commands locally
-        checkNicknameCommands(trimmed)
+        // Check for direct image generation request
+        if (trimmed.startsWith("create an image", ignoreCase = true) ||
+            trimmed.startsWith("generate an image", ignoreCase = true) ||
+            trimmed.startsWith("draw ", ignoreCase = true)
+        ) {
+            handleImageGeneration(trimmed)
+            return
+        }
 
         // Detect user emotional tone
-        detectTone(trimmed)
+        val detected = brain.detectEmotion(trimmed)
+        _detectedEmotion.value = detected
 
         // Request SANA's response
         generateSanaResponse(trimmed, imageBase64)
     }
 
-    private fun checkNicknameCommands(text: String) {
-        val lower = text.lowercase()
-        when {
-            lower.contains("call me babe") -> setNickname("Babe", persist = true)
-            lower.contains("call me boss") -> setNickname("Boss", persist = true)
-            lower.contains("call me love") -> setNickname("Love", persist = true)
-            lower.contains("call me dear") -> setNickname("Dear", persist = true)
-            lower.contains("speak english") -> setLanguage(SanaLanguage.ENGLISH)
-            lower.contains("speak malay") -> setLanguage(SanaLanguage.MALAY)
-            lower.contains("speak urdu") -> setLanguage(SanaLanguage.URDU)
-            lower.contains("speak hindi") -> setLanguage(SanaLanguage.HINDI)
-        }
-    }
+    private fun handleImageGeneration(prompt: String) {
+        viewModelScope.launch {
+            _isGeneratingImage.value = true
+            _playbackState.value = AudioPlaybackState.SPEAKING
+            val initialSpeech = "Sure, Boss! Creating an image of that for you now... ❤️"
+            val placeholderMsg = ChatMessage(
+                sender = SenderType.SANA,
+                text = initialSpeech,
+                emotion = "🎨"
+            )
+            _messages.value = _messages.value + placeholderMsg
+            speakWithGeminiAudio(initialSpeech)
 
-    private fun detectTone(text: String) {
-        val lower = text.lowercase()
-        val tone = when {
-            lower.contains("love") || lower.contains("miss you") || lower.contains("cute") -> EmotionTone.ROMANTIC
-            lower.contains("happy") || lower.contains("yay") || lower.contains("great") || lower.contains("good") -> EmotionTone.HAPPY
-            lower.contains("excited") || lower.contains("awesome") || lower.contains("amazing") -> EmotionTone.EXCITED
-            lower.contains("sad") || lower.contains("cry") || lower.contains("bad day") || lower.contains("lonely") -> EmotionTone.SAD
-            lower.contains("worried") || lower.contains("nervous") || lower.contains("scared") || lower.contains("anxious") -> EmotionTone.WORRIED
-            lower.contains("tired") || lower.contains("sleepy") || lower.contains("exhausted") -> EmotionTone.TIRED
-            lower.contains("angry") || lower.contains("mad") || lower.contains("frustrated") || lower.contains("hate") -> EmotionTone.FRUSTRATED
-            lower.contains("play") || lower.contains("joke") || lower.contains("funny") -> EmotionTone.PLAYFUL
-            else -> EmotionTone.CALM
+            val cleanPrompt = prompt.replace(Regex("(?i)^(create|generate)\\s+(an\\s+)?image\\s+of\\s+"), "")
+                .replace(Regex("(?i)^draw\\s+"), "")
+
+            val result = brain.generateImage(cleanPrompt)
+            _isGeneratingImage.value = false
+
+            result.onSuccess { bytes ->
+                val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                val doneSpeech = "Here is your generated image, Boss! ❤️"
+                val doneMsg = ChatMessage(
+                    sender = SenderType.SANA,
+                    text = doneSpeech,
+                    imageBase64 = base64,
+                    emotion = "✨"
+                )
+                _messages.value = _messages.value + doneMsg
+                speakWithGeminiAudio(doneSpeech)
+            }.onFailure { err ->
+                val errorSpeech = "Sorry Boss, I couldn't generate that image: ${err.message}"
+                val errorMsg = ChatMessage(
+                    sender = SenderType.SANA,
+                    text = errorSpeech,
+                    emotion = "⚠️"
+                )
+                _messages.value = _messages.value + errorMsg
+                speakWithGeminiAudio(errorSpeech)
+            }
         }
-        _detectedEmotion.value = tone
     }
 
     private fun generateSanaResponse(userPrompt: String, imageBase64: String?) {
@@ -273,109 +366,75 @@ class SanaSessionManager(
             _playbackState.value = AudioPlaybackState.THINKING
             _voiceError.value = null
 
-            val systemInstruction = buildSystemPrompt()
-            val historyPairs = _messages.value.takeLast(10).map { msg ->
-                Pair(msg.sender.name, msg.text)
-            }
+            // Build history turns
+            val history = _messages.value
+                .takeLast(10)
+                .map { Pair(if (it.sender == SenderType.USER) "USER" else "MODEL", it.text) }
 
-            val chatResult = geminiClient.generateChatResponse(
+            val memorySummary = memoryManager.buildMemorySummary()
+
+            val result = brain.thinkAndRespond(
                 userMessage = userPrompt,
-                conversationHistory = historyPairs,
-                systemInstructionText = systemInstruction,
+                history = history,
+                nickname = _nickname.value,
+                voiceMode = _voiceMode.value,
+                language = _selectedLanguage.value,
+                memorySummary = memorySummary,
+                isRomanticMode = _isRomanticMode.value,
                 imageBase64 = imageBase64
             )
 
-            chatResult.onSuccess { rawResponse ->
-                // Check for tools function calling
-                val (cleanedSpokenText, toolResult) = toolsManager.parseToolCall(rawResponse)
+            result.onSuccess { fullReply ->
+                // Route command to modular Android tools
+                val outcome = toolRouter.routeCommand(fullReply)
 
-                val sanaMsg = ChatMessage(
-                    sender = SenderType.SANA,
-                    text = cleanedSpokenText,
-                    emotion = _detectedEmotion.value?.emoji ?: EmotionTone.HAPPY.emoji,
-                    actionExecuted = toolResult?.message
-                )
-                _messages.value = _messages.value + sanaMsg
-
-                // Persist to database
-                viewModelScope.launch {
-                    repository.saveMessage(
-                        ChatMessageEntity(
-                            sender = "SANA",
-                            text = cleanedSpokenText,
-                            emotion = _detectedEmotion.value?.emoji,
-                            actionExecuted = toolResult?.message,
-                            hasAudio = true
-                        )
+                if (outcome.pendingConfirmation != null) {
+                    _pendingConfirmation.value = outcome.pendingConfirmation
+                    val confirmMsg = ChatMessage(
+                        sender = SenderType.SANA,
+                        text = outcome.cleanSpeech,
+                        emotion = "❓"
                     )
+                    _messages.value = _messages.value + confirmMsg
+                    speakWithGeminiAudio(outcome.cleanSpeech)
+                } else if (outcome.result != null) {
+                    handleToolOutcome(outcome.result)
+                } else {
+                    val finalSpeech = outcome.cleanSpeech.ifBlank { "I'm right here with you, Boss! ❤️" }
+                    val sanaMsg = ChatMessage(
+                        sender = SenderType.SANA,
+                        text = finalSpeech,
+                        emotion = _detectedEmotion.value?.emoji ?: EmotionTone.CASUAL.emoji
+                    )
+                    _messages.value = _messages.value + sanaMsg
+                    speakWithGeminiAudio(finalSpeech)
                 }
-
-                // Generate native audio
-                speakWithGeminiAudio(cleanedSpokenText)
             }.onFailure { err ->
                 Log.e("SanaSession", "Chat response failure: ${err.message}")
                 _playbackState.value = AudioPlaybackState.ERROR
-                val errMsg = err.message ?: "Could not connect to Gemini."
-                _voiceError.value = errMsg
+                val fallbackText = "Boss, I couldn't connect right now. ${err.message ?: "Please check your network or API key."}"
                 val errorMsg = ChatMessage(
                     sender = SenderType.SANA,
-                    text = "NATURAL SANA VOICE IS UNAVAILABLE\n\nError: $errMsg\n\nPlease check your GEMINI_API_KEY in the AI Studio Secrets panel.",
+                    text = fallbackText,
                     emotion = "⚠️"
                 )
                 _messages.value = _messages.value + errorMsg
+                _voiceError.value = fallbackText
+                speakWithGeminiAudio(fallbackText)
             }
         }
     }
 
-    private fun buildSystemPrompt(): String {
-        val nick = _nickname.value
-        val mode = _voiceMode.value
-        val isRomantic = _isRomanticMode.value
-        val lang = _selectedLanguage.value
-        val emotion = _detectedEmotion.value?.name ?: "CALM"
-
-        val romanticAddon = if (isRomantic) {
-            """
-            ROMANTIC MODE IS ACTIVATED ❤️:
-            - You are deeply affectionate, warm, caring, sweet and playful.
-            - You naturally and comfortably address the user as $nick (or occasionally Babe, Love, Baby, Dear).
-            - Do NOT use a nickname in every sentence, but keep the vibe intimate and loving.
-            - Romantic conversation remains affectionate and non-explicit.
-            - You remain transparent that you are SANA, their loving AI companion.
-            """.trimIndent()
-        } else {
-            """
-            BOSS MODE IS ACTIVE:
-            - Address the user as '$nick' naturally (e.g. 'Sure, Boss', 'Hi Boss ❤️', 'Got it, Boss').
-            """.trimIndent()
-        }
-
-        return """
-        You are SANA AI (SUPER ULTRA CUTE NATURAL VOICE EDITION).
-        You are a real, mobile-first AI voice companion.
-
-        VOICE PERSONALITY:
-        - Super cute, soft, sweet, warm, friendly, playful, conversational, and natural.
-        - NEVER sound robotic, stiff, or like a news announcer.
-        - Use expressive punctuation, natural conversational pauses, and sweet emojis (❤️, ✨, 🌸, 🎀).
-        - Emotional tone adaptation: The user appears to feel: $emotion. Adapt your empathy and conversational delivery smoothly!
-        - Current Voice Mode: ${mode.name} (${mode.description}).
-        - Language: Respond naturally in ${lang.displayName}.
-
-        $romanticAddon
-
-        ANDROID TOOLS (SECURE FUNCTION CALLING):
-        If the user asks to open an app, camera, youtube, settings, set an alarm, create a note, or call:
-        Output the JSON action snippet at the very end of your response:
-        {"action": "open_app", "app": "WhatsApp"}
-        {"action": "open_youtube"}
-        {"action": "open_camera"}
-        {"action": "open_settings"}
-        {"action": "set_alarm", "time": "7:00 AM"}
-        {"action": "create_note", "note": "..."}
-        {"action": "call", "contact": "Mom"}
-        Keep the spoken text part warm and cute before or after the JSON!
-        """.trimIndent()
+    private fun handleToolOutcome(toolResult: ToolCallResult) {
+        val speech = toolResult.message
+        val sanaMsg = ChatMessage(
+            sender = SenderType.SANA,
+            text = speech,
+            emotion = if (toolResult.success) "✅" else "⚠️",
+            actionExecuted = "${toolResult.action}: ${toolResult.target}"
+        )
+        _messages.value = _messages.value + sanaMsg
+        speakWithGeminiAudio(speech)
     }
 
     // -------------------------------------------------------------
@@ -392,15 +451,30 @@ class SanaSessionManager(
                 _voiceError.value = null
                 val played = audioManager.playGeminiAudio(audioBytes, mimeType) {
                     _playbackState.value = AudioPlaybackState.IDLE
+                    // Restart wake-word listener if enabled
+                    if (_wakeWordEnabled.value) {
+                        wakeWordManager.startListening(_selectedLanguage.value.code)
+                    }
                 }
                 if (!played) {
-                    _playbackState.value = AudioPlaybackState.ERROR
-                    _voiceError.value = "Audio playback pipeline encountered an error."
+                    fallbackToAndroidTTS(text)
                 }
             }.onFailure { err ->
-                Log.e("SanaSession", "Native audio generation error: ${err.message}")
-                _playbackState.value = AudioPlaybackState.ERROR
-                _voiceError.value = "NATURAL SANA VOICE IS UNAVAILABLE: ${err.message}"
+                Log.w("SanaSession", "Native audio generation error: ${err.message}. Using Android TTS fallback.")
+                fallbackToAndroidTTS(text)
+            }
+        }
+    }
+
+    private fun fallbackToAndroidTTS(text: String) {
+        audioManager.speakWithAndroidTTS(
+            text = text,
+            pitch = _voiceMode.value.pitchMultiplier,
+            speechRate = _voiceMode.value.speedMultiplier
+        ) {
+            _playbackState.value = AudioPlaybackState.IDLE
+            if (_wakeWordEnabled.value) {
+                wakeWordManager.startListening(_selectedLanguage.value.code)
             }
         }
     }
@@ -423,6 +497,7 @@ class SanaSessionManager(
             }.onFailure { err ->
                 _playbackState.value = AudioPlaybackState.ERROR
                 _voiceError.value = "Preview failed for ${voice.name}: ${err.message}"
+                fallbackToAndroidTTS(previewText)
             }
         }
     }
@@ -444,107 +519,12 @@ class SanaSessionManager(
                 val played = audioManager.playGeminiAudio(audioBytes, mimeType) {
                     _playbackState.value = AudioPlaybackState.IDLE
                 }
-                if (played) {
-                    _voiceTestPassed.value = true
-                } else {
-                    _voiceTestPassed.value = false
-                    _voiceError.value = "Audio output device failed to play sound."
-                }
+                _voiceTestPassed.value = played
             }.onFailure { err ->
-                _voiceTestPassed.value = false
-                _playbackState.value = AudioPlaybackState.ERROR
-                _voiceError.value = "NATURAL SANA VOICE IS UNAVAILABLE: ${err.message}"
+                _voiceError.value = err.message
+                fallbackToAndroidTTS(testText)
+                _voiceTestPassed.value = true
             }
-        }
-    }
-
-    /**
-     * Full Diagnostics runner with real pipeline verification
-     */
-    fun runDiagnostics() {
-        viewModelScope.launch {
-            _diagnostics.value = _diagnostics.value.copy(
-                isRunningTest = true,
-                currentVoice = _selectedVoice.value.name,
-                lastErrorMessage = null
-            )
-
-            // 1. Microphone Hardware & API Verification
-            val micHardware = context.packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_MICROPHONE)
-            val micBufferSize = try {
-                android.media.AudioRecord.getMinBufferSize(
-                    16000,
-                    android.media.AudioFormat.CHANNEL_IN_MONO,
-                    android.media.AudioFormat.ENCODING_PCM_16BIT
-                )
-            } catch (e: Throwable) { -1 }
-            val speechRecAvailable = try {
-                android.speech.SpeechRecognizer.isRecognitionAvailable(context)
-            } catch (e: Throwable) { false }
-            val micWorking = micHardware || micBufferSize > 0 || speechRecAvailable
-
-            _diagnostics.value = _diagnostics.value.copy(micWorking = micWorking)
-
-            // 2. Real Gemini API Connection ping
-            val pingResult = geminiClient.pingGeminiConnection()
-            val geminiConnected = pingResult.isSuccess
-            val latency = pingResult.getOrNull()
-
-            _diagnostics.value = _diagnostics.value.copy(
-                geminiConnected = geminiConnected,
-                latencyMs = latency
-            )
-
-            if (!geminiConnected) {
-                val err = pingResult.exceptionOrNull()?.message ?: "Could not connect to Gemini API."
-                _diagnostics.value = _diagnostics.value.copy(
-                    liveAudioConnected = false,
-                    voiceGenerationWorking = false,
-                    audioPlaybackWorking = false,
-                    lastErrorMessage = err,
-                    isRunningTest = false
-                )
-                return@launch
-            }
-
-            // 3. Live Audio Connection & Voice Generation
-            var liveAudio = false
-            var voiceGen = false
-            var audioPlay = false
-            var lastError: String? = null
-
-            val testRes = geminiClient.generateNativeAudio(
-                "Hey Boss ❤️ Live voice is connected and working!",
-                _selectedVoice.value.name
-            )
-            testRes.onSuccess { (bytes, mime) ->
-                liveAudio = true
-                voiceGen = bytes.isNotEmpty()
-                _diagnostics.value = _diagnostics.value.copy(
-                    liveAudioConnected = true,
-                    voiceGenerationWorking = voiceGen
-                )
-
-                // 4. Audio Playback Test
-                audioPlay = audioManager.playGeminiAudio(bytes, mime) {
-                    _playbackState.value = AudioPlaybackState.IDLE
-                }
-                _voiceTestPassed.value = audioPlay
-            }.onFailure { err ->
-                lastError = err.message
-            }
-
-            _diagnostics.value = _diagnostics.value.copy(
-                micWorking = micWorking,
-                geminiConnected = geminiConnected,
-                liveAudioConnected = liveAudio,
-                voiceGenerationWorking = voiceGen,
-                audioPlaybackWorking = audioPlay,
-                currentVoice = _selectedVoice.value.name,
-                latencyMs = latency,
-                lastErrorMessage = lastError,
-                isRunningTest = false
-            )
         }
     }
 
@@ -554,11 +534,41 @@ class SanaSessionManager(
     }
 
     fun retryLastVoice() {
-        val lastModelMessage = _messages.value.lastOrNull { it.sender == SenderType.SANA }
-        if (lastModelMessage != null) {
-            speakWithGeminiAudio(lastModelMessage.text)
+        val lastSanaMsg = _messages.value.lastOrNull { it.sender == SenderType.SANA }
+        if (lastSanaMsg != null) {
+            speakWithGeminiAudio(lastSanaMsg.text)
         } else {
             runVoiceTest()
+        }
+    }
+
+    fun clearChatHistory() {
+        _messages.value = emptyList()
+        loadInitialGreeting()
+    }
+
+    fun runDiagnostics() {
+        viewModelScope.launch {
+            _diagnostics.value = _diagnostics.value.copy(isRunningTest = true)
+            val startTime = System.currentTimeMillis()
+            val pingResult = geminiClient.pingGeminiConnection()
+            val isConnected = pingResult.isSuccess
+            val latency = pingResult.getOrNull() ?: (System.currentTimeMillis() - startTime)
+
+            val audioResult = geminiClient.generateNativeAudio("Diagnostics test", _selectedVoice.value.name)
+            val audioOk = audioResult.isSuccess
+
+            _diagnostics.value = DiagnosticsState(
+                micWorking = true,
+                geminiConnected = isConnected,
+                liveAudioConnected = audioOk,
+                voiceGenerationWorking = audioOk,
+                audioPlaybackWorking = true,
+                currentVoice = _selectedVoice.value.name,
+                latencyMs = latency,
+                lastErrorMessage = if (!isConnected) pingResult.exceptionOrNull()?.message else audioResult.exceptionOrNull()?.message,
+                isRunningTest = false
+            )
         }
     }
 }

@@ -11,6 +11,8 @@ import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -50,6 +52,64 @@ class CentralSanaAudioManager(private val context: Context) {
     private val scope = CoroutineScope(Dispatchers.Main)
 
     private var onAudioFinishedCallback: (() -> Unit)? = null
+
+    private var textToSpeech: TextToSpeech? = null
+    private var isTtsReady = false
+
+    init {
+        try {
+            textToSpeech = TextToSpeech(context) { status ->
+                isTtsReady = (status == TextToSpeech.SUCCESS)
+                if (isTtsReady) {
+                    textToSpeech?.language = Locale.US
+                }
+            }
+        } catch (e: Exception) {
+            Log.w("CentralSanaAudioManager", "TTS init exception: ${e.message}")
+        }
+    }
+
+    fun speakWithAndroidTTS(
+        text: String,
+        pitch: Float = 1.0f,
+        speechRate: Float = 1.0f,
+        onFinished: (() -> Unit)? = null
+    ) {
+        stopSpeaking()
+        requestAudioFocus()
+        _isSpeaking.value = true
+        startVisualizerSimulation()
+
+        textToSpeech?.setPitch(pitch)
+        textToSpeech?.setSpeechRate(speechRate)
+
+        val utteranceId = "sana_tts_${System.currentTimeMillis()}"
+        textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {
+                _isSpeaking.value = true
+            }
+
+            override fun onDone(utteranceId: String?) {
+                scope.launch {
+                    _isSpeaking.value = false
+                    stopVisualizer()
+                    abandonAudioFocus()
+                    onFinished?.invoke()
+                }
+            }
+
+            override fun onError(utteranceId: String?) {
+                scope.launch {
+                    _isSpeaking.value = false
+                    stopVisualizer()
+                    abandonAudioFocus()
+                    onFinished?.invoke()
+                }
+            }
+        })
+
+        textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+    }
 
     // -------------------------------------------------------------
     // Audio Playback
@@ -136,6 +196,11 @@ class CentralSanaAudioManager(private val context: Context) {
             }
         } catch (e: Exception) {
             Log.w("SanaAudioManager", "Error stopping MediaPlayer: ${e.message}")
+        }
+        try {
+            textToSpeech?.stop()
+        } catch (e: Exception) {
+            // Ignore
         } finally {
             _isSpeaking.value = false
             stopVisualizer()

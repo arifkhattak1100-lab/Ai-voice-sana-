@@ -55,7 +55,9 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RecordVoiceOver
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
@@ -94,7 +96,9 @@ import com.example.data.model.ChatMessage
 import com.example.data.model.SenderType
 import com.example.service.SanaBackgroundService
 import com.example.session.SanaSessionManager
+import com.example.ui.components.ConfirmationDialog
 import com.example.ui.components.MemoryDialog
+import com.example.ui.components.PermissionCenterDialog
 import com.example.ui.components.SanaAvatarVisualizer
 import com.example.ui.components.SettingsSheet
 import com.example.ui.components.VoiceDiagnosticsDialog
@@ -142,6 +146,11 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
     var showDiagnostics by remember { mutableStateOf(false) }
     var showMemoryDialog by remember { mutableStateOf(false) }
     var showSettingsSheet by remember { mutableStateOf(false) }
+    var showPermissionsDialog by remember { mutableStateOf(false) }
+
+    val pendingConfirmation by sessionManager.pendingConfirmation.collectAsState()
+    val confirmationEnabled by sessionManager.confirmationEnabled.collectAsState()
+    val confirmationLevel by sessionManager.confirmationLevel.collectAsState()
 
     // Text input & image
     var textInput by remember { mutableStateOf("") }
@@ -178,6 +187,13 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
         }
     }
 
+    // Generic permission launcher for Permission Center
+    val genericPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) {
+        sessionManager.permissionManager.refreshPermissions()
+    }
+
     Scaffold(
         modifier = Modifier
             .fillMaxSize()
@@ -200,6 +216,7 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
                 onToggleRomantic = { sessionManager.toggleRomanticMode(!isRomanticMode) },
                 onOpenVoiceStudio = { showVoiceStudio = true },
                 onOpenDiagnostics = { showDiagnostics = true },
+                onOpenPermissions = { showPermissionsDialog = true },
                 onOpenMemory = { showMemoryDialog = true },
                 onOpenSettings = { showSettingsSheet = true }
             )
@@ -351,6 +368,24 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
                         )
                     }
                 }
+            }
+
+            // Quick Phone Control Actions
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 14.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                ActionQuickChip("🔋 Battery") { sessionManager.sendMessage("What's my battery level?") }
+                ActionQuickChip("💬 WhatsApp") { sessionManager.sendMessage("SANA, open WhatsApp") }
+                ActionQuickChip("📷 Camera") { sessionManager.sendMessage("SANA, open camera") }
+                ActionQuickChip("🗺️ Maps") { sessionManager.sendMessage("SANA, open maps") }
+                ActionQuickChip("🎵 Play Media") { sessionManager.sendMessage("SANA, play music") }
+                ActionQuickChip("⏸️ Pause Media") { sessionManager.sendMessage("SANA, pause music") }
+                ActionQuickChip("🔔 Notifications") { sessionManager.sendMessage("SANA, do I have any messages?") }
+                ActionQuickChip("🛡️ Permissions") { showPermissionsDialog = true }
             }
 
             // Conversation Messages Feed
@@ -535,6 +570,14 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
                     context.startService(intent)
                 }
             },
+            confirmationEnabled = confirmationEnabled,
+            onToggleConfirmation = { sessionManager.toggleConfirmation(it) },
+            confirmationLevel = confirmationLevel,
+            onConfirmationLevelChange = { sessionManager.setConfirmationLevel(it) },
+            onOpenPermissions = {
+                showSettingsSheet = false
+                showPermissionsDialog = true
+            },
             onOpenMemory = {
                 showSettingsSheet = false
                 showMemoryDialog = true
@@ -544,6 +587,24 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
                 showDiagnostics = true
             },
             onDismiss = { showSettingsSheet = false }
+        )
+    }
+
+    if (showPermissionsDialog) {
+        PermissionCenterDialog(
+            permissionManager = sessionManager.permissionManager,
+            onRequestPermission = { perm ->
+                genericPermissionLauncher.launch(perm)
+            },
+            onDismiss = { showPermissionsDialog = false }
+        )
+    }
+
+    if (pendingConfirmation != null) {
+        ConfirmationDialog(
+            pending = pendingConfirmation!!,
+            onConfirm = { sessionManager.confirmPendingAction() },
+            onDismiss = { sessionManager.dismissPendingAction() }
         )
     }
 }
@@ -556,6 +617,7 @@ private fun TopCompanionBar(
     onToggleRomantic: () -> Unit,
     onOpenVoiceStudio: () -> Unit,
     onOpenDiagnostics: () -> Unit,
+    onOpenPermissions: () -> Unit,
     onOpenMemory: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
@@ -624,6 +686,21 @@ private fun TopCompanionBar(
                 )
             }
 
+            // Permissions Center
+            IconButton(
+                onClick = onOpenPermissions,
+                modifier = Modifier
+                    .size(36.dp)
+                    .testTag("top_permissions_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Shield,
+                    contentDescription = "Permissions",
+                    tint = Color(0xFF64B5F6),
+                    modifier = Modifier.size(19.dp)
+                )
+            }
+
             // Diagnostics
             IconButton(
                 onClick = onOpenDiagnostics,
@@ -669,6 +746,25 @@ private fun TopCompanionBar(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun ActionQuickChip(label: String, onClick: () -> Unit) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+        shape = RoundedCornerShape(12.dp),
+        modifier = Modifier.clickable { onClick() }
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+            style = MaterialTheme.typography.labelMedium.copy(
+                fontWeight = FontWeight.SemiBold,
+                color = Color.White,
+                fontSize = 11.sp
+            )
+        )
     }
 }
 

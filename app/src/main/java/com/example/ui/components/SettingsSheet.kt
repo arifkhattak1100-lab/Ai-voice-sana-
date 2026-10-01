@@ -60,6 +60,7 @@ import androidx.compose.ui.unit.sp
 import com.example.data.model.GeminiVoice
 import com.example.data.model.SanaLanguage
 import com.example.data.model.VoiceMode
+import com.example.tools.ConfirmationLevel
 import com.example.ui.theme.SanaPeachAccent
 import com.example.ui.theme.SanaPinkPrimary
 import com.example.ui.theme.SanaPinkSecondary
@@ -84,6 +85,11 @@ fun SettingsSheet(
     onToggleWakeWord: (Boolean) -> Unit,
     backgroundAssistantEnabled: Boolean,
     onToggleBackgroundAssistant: (Boolean) -> Unit,
+    confirmationEnabled: Boolean = true,
+    onToggleConfirmation: (Boolean) -> Unit = {},
+    confirmationLevel: ConfirmationLevel = ConfirmationLevel.CONFIRM,
+    onConfirmationLevelChange: (ConfirmationLevel) -> Unit = {},
+    onOpenPermissions: () -> Unit = {},
     onOpenMemory: () -> Unit,
     onOpenDiagnostics: () -> Unit,
     onDismiss: () -> Unit
@@ -475,7 +481,92 @@ fun SettingsSheet(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // 7. Memory & Diagnostics quick triggers
+            // 7. Action Confirmation System
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Action Confirmation",
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color.White,
+                                fontSize = 14.sp
+                            )
+                            Text(
+                                text = "Ask \"Boss, should I...?\" before sensitive actions",
+                                fontSize = 11.sp,
+                                color = SanaSubtext
+                            )
+                        }
+                        Switch(
+                            checked = confirmationEnabled,
+                            onCheckedChange = onToggleConfirmation,
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = SanaPinkPrimary
+                            ),
+                            modifier = Modifier.testTag("confirmation_switch")
+                        )
+                    }
+
+                    if (confirmationEnabled) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Text(
+                            text = "CONFIRMATION LEVEL",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = SanaPeachAccent,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            ConfirmationLevel.entries.forEach { level ->
+                                FilterChip(
+                                    selected = confirmationLevel == level,
+                                    onClick = { onConfirmationLevelChange(level) },
+                                    label = { Text(level.name, fontSize = 11.sp) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = SanaPinkPrimary,
+                                        selectedLabelColor = Color.White,
+                                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                        labelColor = Color.White
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // 8. Permission Center & Memory & Diagnostics
+            Button(
+                onClick = onOpenPermissions,
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("settings_open_permissions_button")
+            ) {
+                Icon(imageVector = Icons.Default.Security, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Open Permissions Center", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp)

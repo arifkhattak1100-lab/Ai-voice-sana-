@@ -1,12 +1,18 @@
 package com.example.data.model
 
-enum class VoiceMode(val label: String, val description: String, val defaultVoiceName: String) {
-    CUTE("CUTE", "Soft, sweet, cheerful & charming", "Aoede"),
-    WARM("WARM", "Gentle, comforting & reassuring", "Autonoe"),
-    CALM("CALM", "Serene, peaceful & soft-spoken", "Leda"),
-    PLAYFUL("PLAYFUL", "Bouncy, teasing & energetic", "Aoede"),
-    ROMANTIC("ROMANTIC ❤️", "Sweet, affectionate & intimate", "Aoede"),
-    PROFESSIONAL("PROFESSIONAL", "Composed, clear & articulate", "Kore")
+enum class VoiceMode(
+    val label: String,
+    val description: String,
+    val defaultVoiceName: String,
+    val pitchMultiplier: Float = 1.0f,
+    val speedMultiplier: Float = 1.0f
+) {
+    CUTE("CUTE", "Soft, sweet, cheerful & charming", "Aoede", 1.25f, 1.05f),
+    WARM("WARM", "Gentle, comforting & reassuring", "Autonoe", 1.05f, 0.95f),
+    CALM("CALM", "Serene, peaceful & soft-spoken", "Leda", 0.95f, 0.90f),
+    PLAYFUL("PLAYFUL", "Bouncy, teasing & energetic", "Aoede", 1.20f, 1.10f),
+    ROMANTIC("ROMANTIC ❤️", "Sweet, affectionate & intimate", "Aoede", 1.10f, 0.92f),
+    PROFESSIONAL("PROFESSIONAL", "Composed, clear & articulate", "Kore", 1.00f, 1.00f)
 }
 
 data class GeminiVoice(
@@ -96,8 +102,13 @@ enum class EmotionTone(val emoji: String, val label: String) {
     SAD("🥺", "Sad"),
     WORRIED("😟", "Worried"),
     TIRED("🥱", "Tired"),
+    STRESSED("😫", "Stressed"),
     FRUSTRATED("😤", "Frustrated"),
+    ANGRY("😡", "Angry"),
+    CONFUSED("🤔", "Confused"),
+    SERIOUS("🧐", "Serious"),
     CALM("🌿", "Calm"),
+    CASUAL("🌸", "Casual"),
     PLAYFUL("🎀", "Playful"),
     ROMANTIC("💖", "Romantic")
 }
