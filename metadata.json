@@ -1,0 +1,6 @@
+{
+  "name": "SANA AI",
+  "description": "Super cute natural voice AI companion powered by Google Gemini native audio.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
