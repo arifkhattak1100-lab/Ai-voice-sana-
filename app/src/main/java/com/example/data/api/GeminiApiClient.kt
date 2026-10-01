@@ -46,7 +46,7 @@ class GeminiApiClient {
         }
 
         val startTime = System.currentTimeMillis()
-        val models = listOf("gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-latest")
+        val models = listOf("gemini-3.5-flash", "gemini-flash-latest")
 
         for (model in models) {
             try {
@@ -96,10 +96,8 @@ class GeminiApiClient {
         }
 
         val modelsToTry = listOf(
-            "gemini-3.8-flash-tts",
-            "gemini-3.8-flash-lite-tts",
-            "gemini-3.1-flash-tts-preview",
-            "gemini-2.5-flash-preview-tts"
+            "gemini-2.5-flash-preview-tts",
+            "gemini-2.5-flash-native-audio-preview-12-2025"
         )
 
         var lastError: Exception? = null
@@ -192,8 +190,6 @@ class GeminiApiClient {
         }
 
         val modelsToTry = listOf(
-            "gemini-3.8-flash",
-            "gemini-3.7-flash",
             "gemini-3.5-flash",
             "gemini-flash-latest"
         )

@@ -205,6 +205,32 @@ fun VoiceDiagnosticsDialog(
                             modifier = Modifier.padding(10.dp)
                         )
                     }
+                } else if (diagnostics.voiceGenerationWorking == true && diagnostics.audioPlaybackWorking == true) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0x3300E676)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Check,
+                                contentDescription = null,
+                                tint = Color(0xFF00E676),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Live voice pipeline is 100% active and working, Boss! ❤️",
+                                color = Color(0xFF00E676),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(16.dp))
