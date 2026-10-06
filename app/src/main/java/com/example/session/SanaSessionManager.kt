@@ -14,6 +14,8 @@ import com.example.audio.CentralSanaAudioManager
 import com.example.audio.SanaWakeWordManager
 import com.example.brain.SanaBrain
 import com.example.data.api.GeminiApiClient
+import com.example.data.api.GeminiLiveConnectionState
+import com.example.data.api.GeminiLiveSession
 import com.example.data.database.ChatMessageEntity
 import com.example.data.database.MemoryEntity
 import com.example.data.database.SanaMemoryManager
@@ -53,6 +55,11 @@ class SanaSessionManager(
     val permissionManager = SanaPermissionManager(context)
     val memoryManager = SanaMemoryManager(repository, viewModelScope)
     val brain = SanaBrain(geminiClient)
+
+    // Gemini Live Session
+    private var geminiLiveSession: GeminiLiveSession? = null
+    private val _liveConnectionState = MutableStateFlow(GeminiLiveConnectionState.DISCONNECTED)
+    val liveConnectionState: StateFlow<GeminiLiveConnectionState> = _liveConnectionState.asStateFlow()
 
     // Wake Word Manager
     val wakeWordManager = SanaWakeWordManager(
@@ -132,6 +139,31 @@ class SanaSessionManager(
         loadInitialGreeting()
         loadPersistedSettings()
         permissionManager.refreshPermissions()
+        initializeGeminiLive()
+    }
+
+    private fun initializeGeminiLive() {
+        viewModelScope.launch {
+            geminiLiveSession = GeminiLiveSession(
+                onAudioReceived = { audioBytes, mimeType ->
+                    audioManager.playGeminiAudio(audioBytes, mimeType) {
+                        _playbackState.value = AudioPlaybackState.IDLE
+                        if (_wakeWordEnabled.value) {
+                            wakeWordManager.startListening(_selectedLanguage.value.code)
+                        }
+                    }
+                },
+                onStateChanged = { newState ->
+                    _liveConnectionState.value = newState
+                    Log.d("SanaSession", "Live connection state: $newState")
+                },
+                onError = { errorMsg ->
+                    Log.e("SanaSession", "Live session error: $errorMsg")
+                    _voiceError.value = errorMsg
+                }
+            )
+            geminiLiveSession?.connect(_selectedVoice.value.name)
+        }
     }
 
     private fun loadPersistedSettings() {
@@ -158,9 +190,7 @@ class SanaSessionManager(
         _messages.value = listOf(initialMessage)
     }
 
-    // -------------------------------------------------------------
-    // Voice Mode & Voice Selection
-    // -------------------------------------------------------------
+    // --------- Voice Mode & Voice Selection ---------
 
     fun setVoiceMode(mode: VoiceMode) {
         _voiceMode.value = mode
@@ -287,9 +317,7 @@ class SanaSessionManager(
         memoryManager.saveMemory(key, value, "user_note")
     }
 
-    // -------------------------------------------------------------
-    // Conversational Messaging & Audio Generation
-    // -------------------------------------------------------------
+    // --------- Conversational Messaging & Audio Generation ---------
 
     fun sendMessage(userText: String, imageBase64: String? = null) {
         val trimmed = userText.trim()
@@ -441,9 +469,7 @@ class SanaSessionManager(
         speakWithGeminiAudio(speech)
     }
 
-    // -------------------------------------------------------------
-    // Native Audio Generation & Speaking
-    // -------------------------------------------------------------
+    // --------- Native Audio Generation & Speaking ---------
 
     private fun speakWithGeminiAudio(text: String) {
         viewModelScope.launch {
@@ -598,7 +624,7 @@ class SanaSessionManager(
             _diagnostics.value = DiagnosticsState(
                 micWorking = micOk,
                 geminiConnected = geminiConnected,
-                liveAudioConnected = true,
+                liveAudioConnected = _liveConnectionState.value == GeminiLiveConnectionState.CONNECTED,
                 voiceGenerationWorking = true,
                 audioPlaybackWorking = true,
                 currentVoice = activeVoiceLabel,
@@ -609,6 +635,13 @@ class SanaSessionManager(
 
             _voiceTestPassed.value = true
             _voiceError.value = null
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        viewModelScope.launch {
+            geminiLiveSession?.disconnect()
         }
     }
 }
