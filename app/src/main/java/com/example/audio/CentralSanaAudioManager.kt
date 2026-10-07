@@ -56,6 +56,29 @@ class CentralSanaAudioManager(private val context: Context) {
     private var textToSpeech: TextToSpeech? = null
     private var isTtsReady = false
 
+    // Real PCM Audio Streaming components for Gemini Live
+    private var liveTurnCompletionCallback: (() -> Unit)? = null
+
+    private val pcmPlayer = RealtimePcmPlayer(
+        context = context,
+        onPlaybackStateChanged = { playing ->
+            _isSpeaking.value = playing
+            if (!playing) {
+                _audioVisualizerLevel.value = 0f
+            }
+        },
+        onAudioLevelChanged = { level ->
+            if (_isSpeaking.value) {
+                _audioVisualizerLevel.value = level
+            }
+        },
+        onPlaybackCompleted = {
+            liveTurnCompletionCallback?.invoke()
+        }
+    )
+
+    private var pcmRecorder: RealtimePcmRecorder? = null
+
     init {
         try {
             textToSpeech = TextToSpeech(context) { status ->
@@ -68,6 +91,93 @@ class CentralSanaAudioManager(private val context: Context) {
             Log.w("CentralSanaAudioManager", "TTS init exception: ${e.message}")
         }
     }
+
+    // -------------------------------------------------------------
+    // Realtime Two-Way Gemini Live Audio Pipeline
+    // -------------------------------------------------------------
+
+    /**
+     * Starts continuous real microphone streaming for Gemini Live.
+     * Captures raw 16kHz PCM audio bytes and transmits them continuously.
+     * Detects user speech for client-side barge-in.
+     */
+    fun startLiveAudioCapture(
+        onPcmChunk: (ByteArray) -> Unit,
+        onBargeIn: () -> Unit,
+        onPlaybackFinished: () -> Unit = {}
+    ): Boolean {
+        stopSpeaking()
+        stopListening()
+
+        liveTurnCompletionCallback = onPlaybackFinished
+
+        pcmRecorder?.stop()
+        pcmRecorder = RealtimePcmRecorder(
+            onPcmChunk = onPcmChunk,
+            onAudioLevelChanged = { level ->
+                if (!_isSpeaking.value && _isListening.value) {
+                    _audioVisualizerLevel.value = level
+                }
+            },
+            onVoiceActivity = { isUserSpeaking, _ ->
+                if (isUserSpeaking && _isSpeaking.value) {
+                    Log.d("SanaLive", "Barge-in triggered: user started speaking while SANA was speaking")
+                    interruptLiveAudio()
+                    onBargeIn()
+                }
+            }
+        )
+
+        val started = pcmRecorder?.start() == true
+        _isListening.value = started
+        if (!started) {
+            _micError.value = "Microphone failed to start"
+        } else {
+            _micError.value = null
+        }
+        return started
+    }
+
+    /**
+     * Enqueues 24kHz raw PCM chunk from Gemini Live to AudioTrack for speaker output.
+     */
+    fun playLiveAudioChunk(pcmBytes: ByteArray) {
+        pcmPlayer.enqueueAudioChunk(pcmBytes)
+    }
+
+    /**
+     * Signals that Gemini Live finished transmitting audio for the current turn.
+     */
+    fun notifyLiveTurnComplete() {
+        pcmPlayer.onTurnCompleted()
+    }
+
+    /**
+     * Instantly stops speaker playback when user barges in or cancels.
+     */
+    fun interruptLiveAudio() {
+        pcmPlayer.interrupt()
+        _isSpeaking.value = false
+        _audioVisualizerLevel.value = 0f
+    }
+
+    /**
+     * Stops the live conversation completely.
+     */
+    fun stopLiveConversation() {
+        pcmRecorder?.stop()
+        pcmRecorder = null
+        pcmPlayer.stop()
+        _isListening.value = false
+        _isSpeaking.value = false
+        _audioVisualizerLevel.value = 0f
+    }
+
+    fun isLiveCaptureActive(): Boolean = pcmRecorder?.isCapturing() == true
+
+    // -------------------------------------------------------------
+    // Fallback & Diagnostics TTS / MediaPlayer
+    // -------------------------------------------------------------
 
     fun speakWithAndroidTTS(
         text: String,
@@ -111,20 +221,11 @@ class CentralSanaAudioManager(private val context: Context) {
         textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
     }
 
-    // -------------------------------------------------------------
-    // Audio Playback
-    // -------------------------------------------------------------
-
-    /**
-     * Plays raw audio bytes returned by Gemini Native Audio / TTS.
-     * Accurately supports raw PCM 24000Hz 16-bit Mono, WAV, MP3, etc.
-     */
     fun playGeminiAudio(
         audioBytes: ByteArray,
         mimeType: String,
         onFinished: (() -> Unit)? = null
     ): Boolean {
-        // Immediate interruption of previous playback
         stopSpeaking()
 
         onAudioFinishedCallback = onFinished
@@ -182,10 +283,8 @@ class CentralSanaAudioManager(private val context: Context) {
         }
     }
 
-    /**
-     * Immediately stops SANA speaking (Interruption).
-     */
     fun stopSpeaking() {
+        interruptLiveAudio()
         try {
             if (mediaPlayer != null) {
                 if (mediaPlayer?.isPlaying == true) {
@@ -199,8 +298,7 @@ class CentralSanaAudioManager(private val context: Context) {
         }
         try {
             textToSpeech?.stop()
-        } catch (e: Exception) {
-            // Ignore
+        } catch (_: Exception) {
         } finally {
             _isSpeaking.value = false
             stopVisualizer()
@@ -209,11 +307,10 @@ class CentralSanaAudioManager(private val context: Context) {
     }
 
     // -------------------------------------------------------------
-    // Microphone & Speech Recognition
+    // Microphone & Speech Recognition (Fallback / Single-turn)
     // -------------------------------------------------------------
 
     fun startListening(languageCode: String = "en-US", onSpeechResult: (String) -> Unit) {
-        // Stop SANA if she's currently speaking (Interruption principle)
         stopSpeaking()
 
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
@@ -236,7 +333,6 @@ class CentralSanaAudioManager(private val context: Context) {
                     }
 
                     override fun onRmsChanged(rmsdB: Float) {
-                        // Normalize -2dB..10dB to 0..1 range
                         val norm = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
                         _audioVisualizerLevel.value = norm
                     }
@@ -366,15 +462,10 @@ class CentralSanaAudioManager(private val context: Context) {
         }
     }
 
-    // -------------------------------------------------------------
-    // Visualizer Simulation during playback
-    // -------------------------------------------------------------
-
     private fun startVisualizerSimulation() {
         visualizerJob?.cancel()
         visualizerJob = scope.launch {
             while (_isSpeaking.value) {
-                // Organic rhythmic breathing & speaking wave
                 val base = (Math.sin(System.currentTimeMillis() / 150.0) * 0.35 + 0.55).toFloat()
                 val variation = (Math.random() * 0.25).toFloat()
                 _audioVisualizerLevel.value = (base + variation).coerceIn(0.2f, 1f)
@@ -390,10 +481,6 @@ class CentralSanaAudioManager(private val context: Context) {
         _audioVisualizerLevel.value = 0f
     }
 
-    // -------------------------------------------------------------
-    // PCM to WAV Packaging (24kHz 16-bit Mono)
-    // -------------------------------------------------------------
-
     private fun pcmToWav(
         pcmData: ByteArray,
         sampleRate: Int = 24000,
@@ -405,17 +492,15 @@ class CentralSanaAudioManager(private val context: Context) {
         val byteRate = sampleRate * channels * bitsPerSample / 8
 
         val header = ByteArray(44)
-        // RIFF header
         header[0] = 'R'.code.toByte(); header[1] = 'I'.code.toByte(); header[2] = 'F'.code.toByte(); header[3] = 'F'.code.toByte()
         header[4] = (totalDataLen and 0xff).toByte()
         header[5] = ((totalDataLen shr 8) and 0xff).toByte()
         header[6] = ((totalDataLen shr 16) and 0xff).toByte()
         header[7] = ((totalDataLen shr 24) and 0xff).toByte()
         header[8] = 'W'.code.toByte(); header[9] = 'A'.code.toByte(); header[10] = 'V'.code.toByte(); header[11] = 'E'.code.toByte()
-        // fmt chunk
         header[12] = 'f'.code.toByte(); header[13] = 'm'.code.toByte(); header[14] = 't'.code.toByte(); header[15] = ' '.code.toByte()
-        header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0 // 16 for PCM
-        header[20] = 1; header[21] = 0 // format = 1
+        header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0
+        header[20] = 1; header[21] = 0
         header[22] = (channels.toInt() and 0xff).toByte()
         header[23] = ((channels.toInt() shr 8) and 0xff).toByte()
         header[24] = (sampleRate and 0xff).toByte()
@@ -426,11 +511,10 @@ class CentralSanaAudioManager(private val context: Context) {
         header[29] = ((byteRate shr 8) and 0xff).toByte()
         header[30] = ((byteRate shr 16) and 0xff).toByte()
         header[31] = ((byteRate shr 24) and 0xff).toByte()
-        header[32] = ((channels * bitsPerSample / 8) and 0xff).toByte() // block align
+        header[32] = ((channels * bitsPerSample / 8) and 0xff).toByte()
         header[33] = 0
         header[34] = (bitsPerSample.toInt() and 0xff).toByte()
         header[35] = 0
-        // data chunk
         header[36] = 'd'.code.toByte(); header[37] = 'a'.code.toByte(); header[38] = 't'.code.toByte(); header[39] = 'a'.code.toByte()
         header[40] = (totalAudioLen and 0xff).toByte()
         header[41] = ((totalAudioLen shr 8) and 0xff).toByte()

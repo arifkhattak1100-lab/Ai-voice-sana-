@@ -184,11 +184,11 @@ fun SanaAvatarVisualizer(
                 .padding(horizontal = 10.dp, vertical = 4.dp)
         ) {
             val statusText = when (playbackState) {
-                AudioPlaybackState.SPEAKING -> "Speaking with $currentVoiceName voice..."
-                AudioPlaybackState.LISTENING -> "Listening to you, Boss..."
-                AudioPlaybackState.THINKING -> "Thinking with love..."
-                AudioPlaybackState.ERROR -> "Voice paused"
-                else -> if (isRomanticMode) "Loving companion active ❤️" else "Ready to talk with you"
+                AudioPlaybackState.SPEAKING -> "🔊 Speaking ($currentVoiceName)... Tap Stop to interrupt"
+                AudioPlaybackState.LISTENING -> "🟢 Listening... Speak anytime"
+                AudioPlaybackState.THINKING -> "✨ Gemini Live processing..."
+                AudioPlaybackState.ERROR -> "Voice error / Check API key"
+                else -> if (isRomanticMode) "Loving companion ready ❤️ Tap Start" else "Tap Start to talk continuously with SANA"
             }
 
             Text(

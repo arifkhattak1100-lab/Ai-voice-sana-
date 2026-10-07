@@ -29,9 +29,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onPause() {
+        super.onPause()
+        if (::sessionManager.isInitialized) {
+            sessionManager.onAppPaused()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::sessionManager.isInitialized) {
+            sessionManager.onAppResumed()
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         if (::sessionManager.isInitialized) {
+            sessionManager.stopLiveConversation()
             sessionManager.audioManager.stopSpeaking()
             sessionManager.audioManager.stopListening()
         }

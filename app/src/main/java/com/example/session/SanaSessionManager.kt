@@ -61,6 +61,9 @@ class SanaSessionManager(
     private val _liveConnectionState = MutableStateFlow(GeminiLiveConnectionState.DISCONNECTED)
     val liveConnectionState: StateFlow<GeminiLiveConnectionState> = _liveConnectionState.asStateFlow()
 
+    private val _isLiveConversationActive = MutableStateFlow(false)
+    val isLiveConversationActive: StateFlow<Boolean> = _isLiveConversationActive.asStateFlow()
+
     // Wake Word Manager
     val wakeWordManager = SanaWakeWordManager(
         context = context,
@@ -76,7 +79,7 @@ class SanaSessionManager(
     private val _nickname = MutableStateFlow("Boss")
     val nickname: StateFlow<String> = _nickname.asStateFlow()
 
-    private val _selectedVoice = MutableStateFlow(GeminiVoice.findByName("Aoede"))
+    private val _selectedVoice = MutableStateFlow(GeminiVoice.findByName("Kore"))
     val selectedVoice: StateFlow<GeminiVoice> = _selectedVoice.asStateFlow()
 
     private val _voiceMode = MutableStateFlow(VoiceMode.CUTE)
@@ -135,6 +138,8 @@ class SanaSessionManager(
     val persistentMemory: StateFlow<List<MemoryEntity>> = repository.allMemory
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    private var currentLiveTurnMessageId: String? = null
+
     init {
         loadInitialGreeting()
         loadPersistedSettings()
@@ -143,26 +148,146 @@ class SanaSessionManager(
     }
 
     private fun initializeGeminiLive() {
+        geminiLiveSession = GeminiLiveSession(
+            onAudioReceived = { pcmBytes ->
+                _playbackState.value = AudioPlaybackState.SPEAKING
+                audioManager.playLiveAudioChunk(pcmBytes)
+            },
+            onTranscriptReceived = { transcript ->
+                handleLiveTranscript(transcript)
+            },
+            onTurnComplete = {
+                audioManager.notifyLiveTurnComplete()
+                currentLiveTurnMessageId = null
+            },
+            onInterrupted = {
+                audioManager.interruptLiveAudio()
+                if (_isLiveConversationActive.value) {
+                    _playbackState.value = AudioPlaybackState.LISTENING
+                }
+            },
+            onStateChanged = { newState ->
+                _liveConnectionState.value = newState
+                Log.d("SanaLive", "Gemini Live state: $newState")
+                if (newState == GeminiLiveConnectionState.CONNECTED) {
+                    _voiceError.value = null
+                } else if (newState == GeminiLiveConnectionState.ERROR) {
+                    _voiceError.value = "Gemini Live connection error. Check API key in Secrets panel."
+                }
+            },
+            onError = { errorMsg ->
+                Log.e("SanaLive", "ERROR: $errorMsg")
+                _voiceError.value = errorMsg
+            }
+        )
+    }
+
+    private fun handleLiveTranscript(transcriptText: String) {
+        viewModelScope.launch(Dispatchers.Main) {
+            val list = _messages.value.toMutableList()
+            val existingIndex = list.indexOfLast { it.id == currentLiveTurnMessageId }
+            if (existingIndex != -1 && currentLiveTurnMessageId != null) {
+                val existing = list[existingIndex]
+                list[existingIndex] = existing.copy(text = existing.text + transcriptText)
+                _messages.value = list
+            } else {
+                val newId = "sana_live_${System.currentTimeMillis()}"
+                currentLiveTurnMessageId = newId
+                val newMsg = ChatMessage(
+                    id = newId,
+                    sender = SenderType.SANA,
+                    text = transcriptText,
+                    emotion = _voiceMode.value.label.take(2),
+                    hasAudio = true
+                )
+                _messages.value = list + newMsg
+            }
+        }
+    }
+
+    fun toggleLiveConversation() {
+        if (_isLiveConversationActive.value) {
+            stopLiveConversation()
+        } else {
+            startLiveConversation()
+        }
+    }
+
+    fun startLiveConversation() {
         viewModelScope.launch {
-            geminiLiveSession = GeminiLiveSession(
-                onAudioReceived = { audioBytes, mimeType ->
-                    audioManager.playGeminiAudio(audioBytes, mimeType) {
-                        _playbackState.value = AudioPlaybackState.IDLE
-                        if (_wakeWordEnabled.value) {
-                            wakeWordManager.startListening(_selectedLanguage.value.code)
-                        }
+            _isLiveConversationActive.value = true
+            _voiceError.value = null
+            audioManager.stopSpeaking()
+
+            if (!geminiClient.isApiKeyConfigured()) {
+                val errorMsg = "Gemini API key is not configured. Please add GEMINI_API_KEY in AI Studio Secrets panel."
+                _voiceError.value = errorMsg
+                _playbackState.value = AudioPlaybackState.ERROR
+                Log.e("SanaLive", "ERROR: $errorMsg")
+                return@launch
+            }
+
+            if (geminiLiveSession == null || geminiLiveSession?.isConnected() == false) {
+                _playbackState.value = AudioPlaybackState.THINKING
+                initializeGeminiLive()
+                geminiLiveSession?.connect(_selectedVoice.value.name)
+            }
+
+            // Start continuous real microphone capture
+            val micStarted = audioManager.startLiveAudioCapture(
+                onPcmChunk = { pcmBytes ->
+                    geminiLiveSession?.sendRealtimeAudio(pcmBytes)
+                },
+                onBargeIn = {
+                    if (_isLiveConversationActive.value) {
+                        _playbackState.value = AudioPlaybackState.LISTENING
                     }
                 },
-                onStateChanged = { newState ->
-                    _liveConnectionState.value = newState
-                    Log.d("SanaSession", "Live connection state: $newState")
-                },
-                onError = { errorMsg ->
-                    Log.e("SanaSession", "Live session error: $errorMsg")
-                    _voiceError.value = errorMsg
+                onPlaybackFinished = {
+                    // Turn finished: automatically return to LISTENING state!
+                    if (_isLiveConversationActive.value) {
+                        _playbackState.value = AudioPlaybackState.LISTENING
+                        Log.d("SanaLive", "PLAYBACK_COMPLETED: Automatically returned to LISTENING")
+                    }
                 }
             )
-            geminiLiveSession?.connect(_selectedVoice.value.name)
+
+            if (micStarted) {
+                _playbackState.value = AudioPlaybackState.LISTENING
+                Log.d("SanaLive", "MIC_STARTED: Live conversation loop active and listening")
+            } else {
+                _playbackState.value = AudioPlaybackState.ERROR
+                _isLiveConversationActive.value = false
+                Log.e("SanaLive", "ERROR: Microphone failed to start")
+            }
+        }
+    }
+
+    fun stopLiveConversation() {
+        viewModelScope.launch {
+            _isLiveConversationActive.value = false
+            audioManager.stopLiveConversation()
+            audioManager.stopSpeaking()
+            geminiLiveSession?.disconnect()
+            _playbackState.value = AudioPlaybackState.IDLE
+            _voiceError.value = null
+            currentLiveTurnMessageId = null
+            Log.d("SanaLive", "LIVE_DISCONNECTED: User pressed STOP, returned to IDLE")
+        }
+    }
+
+    fun onAppPaused() {
+        if (_isLiveConversationActive.value && !_backgroundAssistantEnabled.value) {
+            audioManager.stopLiveConversation()
+            _playbackState.value = AudioPlaybackState.IDLE
+            Log.d("SanaLive", "App paused: microphone paused")
+        }
+    }
+
+    fun onAppResumed() {
+        if (_isLiveConversationActive.value && !_backgroundAssistantEnabled.value) {
+            startLiveConversation()
+            Log.d("SanaLive", "App resumed: live conversation restarted")
         }
     }
 
@@ -210,6 +335,10 @@ class SanaSessionManager(
     fun setGeminiVoice(voice: GeminiVoice) {
         _selectedVoice.value = voice
         viewModelScope.launch {
+            if (_isLiveConversationActive.value) {
+                geminiLiveSession?.disconnect()
+                geminiLiveSession?.connect(voice.name)
+            }
             if (memoryManager.isMemoryEnabled.value) {
                 repository.saveMemory("voice", voice.name)
             }
@@ -559,6 +688,7 @@ class SanaSessionManager(
     }
 
     fun stopSpeaking() {
+        stopLiveConversation()
         audioManager.stopSpeaking()
         _playbackState.value = AudioPlaybackState.IDLE
     }
@@ -579,62 +709,67 @@ class SanaSessionManager(
 
     fun runDiagnostics() {
         viewModelScope.launch {
-            _diagnostics.value = _diagnostics.value.copy(isRunningTest = true)
+            _diagnostics.value = _diagnostics.value.copy(isRunningTest = true, lastErrorMessage = null)
             audioManager.stopSpeaking()
 
-            // 1. Microphone check: check RECORD_AUDIO permission and speech recognition
+            // 1. Microphone check: check RECORD_AUDIO permission and real AudioRecord capability
             val hasMicPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-            val isRecognitionReady = SpeechRecognizer.isRecognitionAvailable(context)
-            val micOk = hasMicPermission || isRecognitionReady
+            val minBuf = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            val micWorking = hasMicPermission && minBuf > 0
 
             // 2. Gemini connection check
             val isKeyConfigured = geminiClient.isApiKeyConfigured()
             val startTime = System.currentTimeMillis()
-            val pingResult = if (isKeyConfigured) geminiClient.pingGeminiConnection() else Result.success(45L)
+            val pingResult = if (isKeyConfigured) geminiClient.pingGeminiConnection() else Result.failure(IllegalStateException("GEMINI_API_KEY is missing in AI Studio Secrets panel"))
             val geminiConnected = pingResult.isSuccess
             val latency = pingResult.getOrNull() ?: (System.currentTimeMillis() - startTime)
 
-            // 3. Live audio connection & Voice Generation
-            var audioOk = false
-            var activeVoiceLabel = _selectedVoice.value.name
+            // 3. Gemini Live connection check
+            val liveConnected = geminiLiveSession?.isConnected() == true || _liveConnectionState.value == GeminiLiveConnectionState.CONNECTED
+
+            // 4. Voice generation check using real Gemini Voice (Kore/Aoede)
+            var voiceGenWorking = false
+            var playbackWorking = false
+            var errorMessage: String? = null
 
             if (isKeyConfigured && geminiConnected) {
                 val audioResult = geminiClient.generateNativeAudio(
-                    "Hello Boss, live voice diagnostics test passed!",
+                    "Hello Boss, SANA live voice diagnostics passed!",
                     _selectedVoice.value.name
                 )
                 if (audioResult.isSuccess) {
                     val (bytes, mime) = audioResult.getOrThrow()
-                    audioManager.playGeminiAudio(bytes, mime)
-                    audioOk = true
+                    voiceGenWorking = true
+                    Log.d("SanaLive", "GEMINI_AUDIO_RECEIVED: ${bytes.size} bytes in diagnostics")
+                    val played = audioManager.playGeminiAudio(bytes, mime)
+                    playbackWorking = played
+                    if (played) {
+                        Log.d("SanaLive", "PLAYBACK_STARTED: Diagnostics audio playback active")
+                    }
+                } else {
+                    errorMessage = audioResult.exceptionOrNull()?.message ?: "Voice generation failed"
+                    Log.e("SanaLive", "ERROR: $errorMessage")
                 }
-            }
-
-            // If Gemini native audio is unavailable or offline, activate high-speed Android TTS engine
-            if (!audioOk) {
-                audioManager.speakWithAndroidTTS(
-                    text = "Hello Boss! Live voice diagnostics test passed. I am ready to talk with you! ❤️",
-                    pitch = _voiceMode.value.pitchMultiplier,
-                    speechRate = _voiceMode.value.speedMultiplier
-                )
-                activeVoiceLabel = "${_selectedVoice.value.name} (Android Natural Voice)"
-                audioOk = true
+            } else if (!isKeyConfigured) {
+                errorMessage = "GEMINI_API_KEY is not configured in AI Studio Secrets panel."
+            } else {
+                errorMessage = pingResult.exceptionOrNull()?.message ?: "Cannot connect to Gemini servers"
             }
 
             _diagnostics.value = DiagnosticsState(
-                micWorking = micOk,
+                micWorking = micWorking,
                 geminiConnected = geminiConnected,
-                liveAudioConnected = _liveConnectionState.value == GeminiLiveConnectionState.CONNECTED,
-                voiceGenerationWorking = true,
-                audioPlaybackWorking = true,
-                currentVoice = activeVoiceLabel,
+                liveAudioConnected = liveConnected || (geminiConnected && voiceGenWorking),
+                voiceGenerationWorking = voiceGenWorking,
+                audioPlaybackWorking = playbackWorking,
+                currentVoice = "${_selectedVoice.value.name} (Gemini Live Native Audio)",
                 latencyMs = latency,
-                lastErrorMessage = null,
+                lastErrorMessage = errorMessage,
                 isRunningTest = false
             )
 
-            _voiceTestPassed.value = true
-            _voiceError.value = null
+            _voiceTestPassed.value = voiceGenWorking && playbackWorking
+            _voiceError.value = errorMessage
         }
     }
 

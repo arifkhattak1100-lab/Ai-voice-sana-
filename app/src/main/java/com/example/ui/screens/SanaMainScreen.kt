@@ -3,6 +3,7 @@ package com.example.ui.screens
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.ImageDecoder
 import android.net.Uri
@@ -12,6 +13,7 @@ import android.util.Base64
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.RepeatMode
@@ -91,6 +93,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.api.GeminiLiveConnectionState
 import com.example.data.model.AudioPlaybackState
 import com.example.data.model.ChatMessage
 import com.example.data.model.SenderType
@@ -140,6 +143,7 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
     val isListening by sessionManager.audioManager.isListening.collectAsState()
     val audioLevel by sessionManager.audioManager.audioVisualizerLevel.collectAsState()
     val micError by sessionManager.audioManager.micError.collectAsState()
+    val isLiveConversationActive by sessionManager.isLiveConversationActive.collectAsState()
 
     // Dialog sheets visibility
     var showVoiceStudio by remember { mutableStateOf(false) }
@@ -174,16 +178,14 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
         }
     }
 
-    // Microphone permission launcher
+    // Microphone permission launcher for real Gemini Live conversation
     var micPermissionGranted by remember { mutableStateOf(false) }
     val micPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { isGranted ->
         micPermissionGranted = isGranted
         if (isGranted) {
-            sessionManager.audioManager.startListening(selectedLanguage.code) { speech ->
-                sessionManager.sendMessage(speech)
-            }
+            sessionManager.startLiveConversation()
         }
     }
 
@@ -241,56 +243,88 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // Voice Controls Row: TEST SANA VOICE & Stop Speaking
+                    // Real Two-Way Gemini Live Voice Controls Row (Start Once, Continuous Loop, Stop Button)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.Center,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Button(
-                            onClick = { sessionManager.runVoiceTest() },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (voiceTestPassed) Color(0xFF00C853) else SanaPinkPrimary
-                            ),
-                            shape = RoundedCornerShape(16.dp),
-                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                            modifier = Modifier.testTag("test_sana_voice_button")
-                        ) {
-                            Icon(
-                                imageVector = if (voiceTestPassed) Icons.Default.Check else Icons.AutoMirrored.Filled.VolumeUp,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (voiceTestPassed) "✓ Natural voice working" else "🎙️ TEST SANA VOICE",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 12.sp,
-                                color = Color.White
-                            )
-                        }
-
-                        // Stop Speaking Button (always visible or during speech)
-                        if (isSpeaking) {
-                            Spacer(modifier = Modifier.width(10.dp))
+                        if (isLiveConversationActive || playbackState == AudioPlaybackState.LISTENING || playbackState == AudioPlaybackState.SPEAKING || playbackState == AudioPlaybackState.THINKING) {
+                            // Prominent STOP button (Requirement 6)
                             Button(
-                                onClick = { sessionManager.stopSpeaking() },
+                                onClick = { sessionManager.stopLiveConversation() },
                                 colors = ButtonDefaults.buttonColors(containerColor = SanaRomanticRed),
-                                shape = RoundedCornerShape(16.dp),
-                                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                                modifier = Modifier.testTag("stop_speaking_button")
+                                shape = RoundedCornerShape(20.dp),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp, vertical = 8.dp),
+                                modifier = Modifier.testTag("stop_live_assistant_button")
                             ) {
                                 Icon(
                                     imageVector = Icons.Default.Stop,
+                                    contentDescription = "Stop",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "STOP ASSISTANT",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp,
+                                    color = Color.White
+                                )
+                            }
+                        } else {
+                            // START LIVE BUTTON (Requirement 1 & 4)
+                            Button(
+                                onClick = {
+                                    val hasAudioPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                                    if (hasAudioPerm) {
+                                        sessionManager.startLiveConversation()
+                                    } else {
+                                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = SanaPinkPrimary),
+                                shape = RoundedCornerShape(20.dp),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                                modifier = Modifier.testTag("start_live_voice_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Mic,
+                                    contentDescription = "Start Live Voice",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "START LIVE VOICE",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp,
+                                    color = Color.White
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(8.dp))
+
+                            // Test voice button
+                            Button(
+                                onClick = { sessionManager.runVoiceTest() },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = if (voiceTestPassed) Color(0xFF00C853) else MaterialTheme.colorScheme.surfaceVariant
+                                ),
+                                shape = RoundedCornerShape(20.dp),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                                modifier = Modifier.testTag("test_sana_voice_button")
+                            ) {
+                                Icon(
+                                    imageVector = if (voiceTestPassed) Icons.Default.Check else Icons.AutoMirrored.Filled.VolumeUp,
                                     contentDescription = null,
                                     tint = Color.White,
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = "Stop",
-                                    fontWeight = FontWeight.Bold,
+                                    text = if (voiceTestPassed) "Voice OK" else "Test Voice",
+                                    fontWeight = FontWeight.SemiBold,
                                     fontSize = 12.sp,
                                     color = Color.White
                                 )
@@ -477,7 +511,7 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
                 }
             }
 
-            // Bottom Control Bar (Microphone, Text Field, Attachment, Send)
+            // Bottom Control Bar (Microphone, Stop, Text Field, Attachment, Send)
             BottomInputBar(
                 textInput = textInput,
                 onTextChange = { textInput = it },
@@ -490,13 +524,22 @@ fun SanaMainScreen(sessionManager: SanaSessionManager) {
                         pendingImageBase64 = null
                     }
                 },
-                isListening = isListening,
+                isListening = isListening || isLiveConversationActive,
+                isLiveActive = isLiveConversationActive,
                 onMicClick = {
-                    if (isListening) {
-                        sessionManager.audioManager.stopListening()
+                    if (isLiveConversationActive || isListening) {
+                        sessionManager.stopLiveConversation()
                     } else {
-                        micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        val hasAudioPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                        if (hasAudioPerm) {
+                            sessionManager.startLiveConversation()
+                        } else {
+                            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        }
                     }
+                },
+                onStopClick = {
+                    sessionManager.stopLiveConversation()
                 },
                 onPickPhoto = {
                     photoPickerLauncher.launch(
@@ -942,13 +985,15 @@ private fun BottomInputBar(
     onTextChange: (String) -> Unit,
     onSend: () -> Unit,
     isListening: Boolean,
+    isLiveActive: Boolean = false,
     onMicClick: () -> Unit,
+    onStopClick: () -> Unit = {},
     onPickPhoto: () -> Unit
 ) {
     val infiniteTransition = rememberInfiniteTransition(label = "mic_pulse")
     val micScale by infiniteTransition.animateFloat(
         initialValue = 1f,
-        targetValue = if (isListening) 1.25f else 1f,
+        targetValue = if (isListening || isLiveActive) 1.25f else 1f,
         animationSpec = infiniteRepeatable(
             animation = tween(durationMillis = 400),
             repeatMode = RepeatMode.Reverse
@@ -984,7 +1029,7 @@ private fun BottomInputBar(
                 onValueChange = onTextChange,
                 placeholder = {
                     Text(
-                        text = if (isListening) "Listening to you, Boss..." else "Talk with SANA...",
+                        text = if (isLiveActive || isListening) "Listening to you, Boss..." else "Talk with SANA...",
                         fontSize = 13.sp,
                         color = SanaSubtext
                     )
@@ -1004,7 +1049,27 @@ private fun BottomInputBar(
 
             Spacer(modifier = Modifier.width(6.dp))
 
-            // Microphone Button
+            // Dedicated STOP Button if Live Assistant is active (Requirement 6)
+            if (isLiveActive || isListening) {
+                IconButton(
+                    onClick = onStopClick,
+                    modifier = Modifier
+                        .size(42.dp)
+                        .clip(CircleShape)
+                        .background(SanaRomanticRed)
+                        .testTag("bottom_stop_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Stop,
+                        contentDescription = "Stop",
+                        tint = Color.White,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(6.dp))
+            }
+
+            // Microphone / Start Button
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
@@ -1012,14 +1077,14 @@ private fun BottomInputBar(
                     .scale(micScale)
                     .clip(CircleShape)
                     .background(
-                        if (isListening) Color(0xFF00E676) else SanaPinkPrimary
+                        if (isLiveActive || isListening) Color(0xFF00E676) else SanaPinkPrimary
                     )
                     .clickable { onMicClick() }
                     .testTag("microphone_button")
             ) {
                 Icon(
-                    imageVector = if (isListening) Icons.Default.Mic else Icons.Default.Mic,
-                    contentDescription = "Microphone",
+                    imageVector = Icons.Default.Mic,
+                    contentDescription = if (isLiveActive || isListening) "Live Voice Active (Tap to Stop)" else "Start Live Voice",
                     tint = Color.White,
                     modifier = Modifier.size(24.dp)
                 )
